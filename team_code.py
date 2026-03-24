@@ -12,7 +12,7 @@
 import joblib
 import numpy as np
 import os
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from xgboost import XGBClassifier
 import sys
 from tqdm import tqdm
 
@@ -120,22 +120,24 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     pbar.close()
 
     features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=bool)
+    labels = np.asarray(labels, dtype=np.int32)
 
     # Train the models on the features.
     if verbose:
         print('Training the model on the data...')
 
-    # This very simple model trains a random forest model with very simple features.
-
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
-
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+    # This simple baseline trains an XGBoost classifier with lightweight settings.
+    model = XGBClassifier(
+        n_estimators=100,
+        max_depth=4,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        random_state=56,
+        n_jobs=1,
+    ).fit(features, labels)
 
     # Create a folder for the model if it does not already exist.
     os.makedirs(model_folder, exist_ok=True)
@@ -186,8 +188,8 @@ def run_model(model, record, data_folder, verbose):
         algo_data, _ = load_signal_data(algo_file)
         algorithmic_features = extract_algorithmic_annotations_features(algo_data)
     else:
-        # Fallback to zeros (length 12)
-        algorithmic_features = np.zeros(12)
+        # Fallback to zeros (length 15)
+        algorithmic_features = np.zeros(15)
 
     features = np.hstack([demographic_features, physiological_features, algorithmic_features]).reshape(1, -1)
 
@@ -403,10 +405,10 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
 def extract_algorithmic_annotations_features(algo_data):
     """
     Extracts sleep architecture and event density features from CAISR outputs.
-    Output vector length: 12
+    Output vector length: 15
     """
     if not algo_data:
-        return np.zeros(12)
+        return np.zeros(15)
 
     features = []
 
@@ -417,7 +419,7 @@ def extract_algorithmic_annotations_features(algo_data):
     
     def count_discrete_events(key):
         if key not in algo_data or total_hours <= 0:
-            return 0.0
+            return 0.0, 0
         
         sig = algo_data[key].astype(float)
         # Create a binary mask: 1 if there is an event, 0 if not
@@ -427,12 +429,13 @@ def extract_algorithmic_annotations_features(algo_data):
         # diff will be 1 at the start of an event, -1 at the end
         diff = np.diff(binary_sig, prepend=0)
         num_events = np.count_nonzero(diff == 1)
-        
-        return num_events / total_hours
+        event_rate_per_hour = num_events / total_hours
+
+        return event_rate_per_hour, num_events
     
-    ahi_auto = count_discrete_events('resp_caisr')      # Automated Apnea-Hypopnea Index
-    arousal_auto = count_discrete_events('arousal_caisr') # Automated Arousal Index
-    limb_auto = count_discrete_events('limb_caisr')    # Automated Limb Movement Index
+    ahi_auto, _ = count_discrete_events('resp_caisr')            # Automated Apnea-Hypopnea Index
+    arousal_auto, num_arousals = count_discrete_events('arousal_caisr') # Automated Arousal Index
+    limb_auto, _ = count_discrete_events('limb_caisr')           # Automated Limb Movement Index
     
     features.extend([ahi_auto, arousal_auto, limb_auto])
 
@@ -453,12 +456,33 @@ def extract_algorithmic_annotations_features(algo_data):
         
         # Sleep Efficiency: (N1+N2+N3+R) / Total
         efficiency = np.mean((valid_stages >= 1) & (valid_stages <= 4))
+
+        # Session duration in hours based on 30-second stage epochs.
+        hours_sleep = (len(valid_stages) * 30.0) / 3600.0
+
+        # Wake After Sleep Onset (WASO): wake epochs (stage=5) after first sleep epoch.
+        # Stage epochs are sampled every 30 seconds, so each epoch is 0.5 minutes.
+        sleep_indices = np.where((valid_stages >= 1) & (valid_stages <= 4))[0]
+        if len(sleep_indices) > 0:
+            first_sleep_idx = sleep_indices[0]
+            wake_after_sleep = np.sum(valid_stages[first_sleep_idx:] == 5)
+            waso_minutes = wake_after_sleep * 0.5
+        else:
+            waso_minutes = 0.0
+
+        # Transition rate per hour.
+        transitions = np.sum(valid_stages[:-1] != valid_stages[1:]) if len(valid_stages) > 1 else 0
+        transitions_per_hour = transitions / hours_sleep if hours_sleep > 0 else 0.0
+
+        # Arousal index per hour using event count from arousal_caisr.
+        arousal_index = num_arousals / hours_sleep if hours_sleep > 0 else 0.0
     else:
         w_pct = n1_pct = n2_pct = n3_pct = r_pct = efficiency = 0.0
+        waso_minutes = transitions_per_hour = arousal_index = 0.0
 
     features.extend([w_pct, n1_pct, n2_pct, n3_pct, r_pct, efficiency])
 
-    # --- 3. Model Confidence / Uncertainty ---
+    # --- 3. Model Confidence / Uncertainty + Sleep Dynamics ---
     # Mean probability of Wake and REM (indicators of sleep stability)
     # We use the raw probability traces
     prob_w = np.mean(algo_data.get('caisr_prob_w', [0]))
@@ -467,7 +491,14 @@ def extract_algorithmic_annotations_features(algo_data):
     
     # Standardize '9.0' or other filler values to 0
     clean_prob = lambda x: x if x < 1.0 else 0.0
-    features.extend([clean_prob(prob_w), clean_prob(prob_n3), clean_prob(prob_arous)])
+    features.extend([
+        clean_prob(prob_w),
+        clean_prob(prob_n3),
+        clean_prob(prob_arous),
+        waso_minutes,
+        transitions_per_hour,
+        arousal_index,
+    ])
 
     return np.array(features)
 
