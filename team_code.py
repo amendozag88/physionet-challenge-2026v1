@@ -12,6 +12,8 @@
 import joblib
 import numpy as np
 import os
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 import sys
 from tqdm import tqdm
@@ -27,6 +29,39 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
+
+# Optional local train/validation split settings.
+# Keep LOCAL_SPLIT_ENABLED=False for competition submission training.
+LOCAL_SPLIT_ENABLED = True
+LOCAL_SPLIT_FRACTION = 0.2
+LOCAL_SPLIT_SEED = 14
+
+
+def _get_local_split_config():
+    """
+    Optional local train/validation split settings.
+
+    Controlled by module-level variables so Challenge entry-point signatures remain unchanged:
+    - LOCAL_SPLIT_ENABLED
+    - LOCAL_SPLIT_FRACTION
+    - LOCAL_SPLIT_SEED
+    """
+    split_enabled = bool(LOCAL_SPLIT_ENABLED)
+
+    try:
+        val_fraction = float(LOCAL_SPLIT_FRACTION)
+    except (TypeError, ValueError):
+        val_fraction = 0.2
+
+    if not (0.0 < val_fraction < 1.0):
+        val_fraction = 0.2
+
+    try:
+        random_seed = int(LOCAL_SPLIT_SEED)
+    except (TypeError, ValueError):
+        random_seed = 56
+
+    return split_enabled, val_fraction, random_seed
 
 
 ################################################################################
@@ -122,9 +157,41 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int32)
 
+    if len(features) == 0:
+        raise RuntimeError('No valid feature rows were extracted for training.')
+
     # Train the models on the features.
     if verbose:
         print('Training the model on the data...')
+
+    split_enabled, val_fraction, random_seed = _get_local_split_config()
+
+    x_train = features
+    y_train = labels
+    x_val = None
+    y_val = None
+
+    if split_enabled and len(features) >= 5:
+        class_counts = np.bincount(labels, minlength=2)
+        use_stratify = np.all(class_counts > 1)
+        stratify_labels = labels if use_stratify else None
+
+        x_train, x_val, y_train, y_val = train_test_split(
+            features,
+            labels,
+            test_size=val_fraction,
+            random_state=random_seed,
+            stratify=stratify_labels,
+        )
+
+        if verbose:
+            split_mode = 'stratified' if use_stratify else 'non-stratified'
+            print(
+                f'Local split enabled ({split_mode}): '
+                f'train={len(x_train)}, val={len(x_val)}, val_fraction={val_fraction:.2f}'
+            )
+    elif split_enabled and verbose:
+        print('Local split requested but dataset is too small; using full dataset for training.')
 
     # This simple baseline trains an XGBoost classifier with lightweight settings.
     model = XGBClassifier(
@@ -137,7 +204,21 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
         eval_metric='logloss',
         random_state=56,
         n_jobs=1,
-    ).fit(features, labels)
+    ).fit(x_train, y_train)
+
+    if x_val is not None and y_val is not None and len(y_val) > 0:
+        val_prob = model.predict_proba(x_val)[:, 1]
+        val_pred = (val_prob >= 0.5).astype(int)
+        val_acc = accuracy_score(y_val, val_pred)
+
+        try:
+            val_auc = roc_auc_score(y_val, val_prob)
+            auc_msg = f'{val_auc:.4f}'
+        except ValueError:
+            auc_msg = 'nan (single-class validation set)'
+
+        if verbose:
+            print(f'Local validation metrics: accuracy={val_acc:.4f}, auroc={auc_msg}')
 
     # Create a folder for the model if it does not already exist.
     os.makedirs(model_folder, exist_ok=True)

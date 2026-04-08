@@ -1,10 +1,20 @@
-# Python example code for the George B. Moody PhysioNet Challenge 2026
+# Moody PhysioNet Challenge 2026 - Multimodal Owls
 
 ## What's in this repository?
 
-This repository contains a simple example that illustrates how to format a Python entry for the [George B. Moody PhysioNet Challenge 2026](https://physionetchallenges.org/2026/). If you are participating in the 2026 Challenge, then we recommend using this repository as a template for your entry. You can remove some of the code, reuse other code, and add new code to create your entry. You do not need to use the models, features, and/or libraries in this example for your entry. We encourage a diversity of approaches to the Challenges.
+This repository contains the contest entry for the team Multimodal Owls, based on the challenge example. 
 
-For this example, we implemented a random forest model with several simple features. (This simple example is **not** designed to perform well, so you should **not** use it as a baseline for your approach's performance.) You can try it by running the following commands on the Challenge training set. If you are using a relatively recent personal computer, then you should be able to run these commands from start to finish on a small subset (1000 records) of the training data in a few minutes or less.
+
+
+## My added config
+For optional local train/validation testing (disabled by default), edit these variables in `team_code.py`:
+
+- `LOCAL_SPLIT_ENABLED = True` to enable a local holdout split,
+- `LOCAL_SPLIT_FRACTION = 0.2` to control validation fraction, and
+- `LOCAL_SPLIT_SEED = 56` for reproducibility.
+
+For competition submission runs, set `LOCAL_SPLIT_ENABLED = False` so training uses all available labeled data.
+
 
 ## How do I run these scripts?
 
